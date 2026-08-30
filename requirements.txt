@@ -1,0 +1,16 @@
+# Daraz Nepal MCP Server — requirements (Python 3.10+)
+
+# MCP framework
+fastmcp>=2.11.0
+
+# HTTP + parsing
+requests>=2.32.0
+urllib3>=2.0.0
+beautifulsoup4>=4.13.0
+
+# Optional: browser fallback when the JSON endpoint is blocked.
+# Install with: pip install playwright && playwright install chromium
+playwright>=1.54.0
+
+# Optional: offline test suite
+pytest>=8.0.0

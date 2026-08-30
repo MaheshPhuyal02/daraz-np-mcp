@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "daraz-np": {
+      "command": "/absolute/path/to/daraz-np-mcp/.venv/bin/python",
+      "args": [
+        "/absolute/path/to/daraz-np-mcp/daraz_np_server.py"
+      ],
+      "env": {
+        "DARAZ_DOMAIN": "www.daraz.com.np",
+        "DARAZ_CURRENCY": "Rs."
+      }
+    }
+  }
+}

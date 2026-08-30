@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Logs & local data
+*.log
+*.db
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local MCP client config (copy mcp.example.json and edit paths)
+mcp.json
+
+# Local scratch
+_to_delete/
