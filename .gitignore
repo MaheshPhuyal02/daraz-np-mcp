@@ -23,3 +23,10 @@ mcp.json
 
 # Local scratch
 _to_delete/
+
+# Saved Daraz login session (live credentials — never commit)
+session.json
+.daraz_mcp/
+
+# Debug page dumps (contain personal order data)
+_debug/

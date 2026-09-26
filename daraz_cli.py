@@ -7,7 +7,9 @@ Lets you verify the scraping layer without wiring up an MCP client.
     python daraz_cli.py search "wireless mouse"
     python daraz_cli.py search "gas stove" --sort price_low --max-price 8000 --limit 5
     python daraz_cli.py search "tv" --category televisions --json
+    python daraz_cli.py search "headphones" --ships-from nepal
     python daraz_cli.py details "https://www.daraz.com.np/products/....html"
+    python daraz_cli.py reviews "https://www.daraz.com.np/products/....html" --stars 1
     python daraz_cli.py categories
     python daraz_cli.py doctor        # connectivity + endpoint health check
 """
@@ -30,15 +32,34 @@ def cmd_search(args: argparse.Namespace) -> int:
         max_price=args.max_price,
         category=args.category,
         in_stock_only=args.in_stock,
+        ships_from=args.ships_from,
         pages=args.pages,
         as_json=args.json,
     )
-    print(out)
+    # With images the tool returns content blocks; the CLI can only show text.
+    if isinstance(out, list):
+        pictures = 0
+        for block in out:
+            if isinstance(block, str):
+                print(block)
+            else:
+                pictures += 1
+        print(f"\n[{pictures} image(s) omitted — the CLI is text only; "
+              "they show up in an MCP client]")
+    else:
+        print(out)
     return 0
 
 
 def cmd_details(args: argparse.Namespace) -> int:
     print(srv._product_details(url=args.url))
+    return 0
+
+
+def cmd_reviews(args: argparse.Namespace) -> int:
+    print(srv._product_reviews(
+        url=args.url, limit=args.limit, stars=args.stars, sort=args.sort, as_json=args.json,
+    ))
     return 0
 
 
@@ -91,6 +112,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     return 0
 
 
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Daraz Nepal CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -108,12 +130,24 @@ def main() -> int:
     s.add_argument("--max-price", type=float, default=None)
     s.add_argument("--category", default=None)
     s.add_argument("--in-stock", action="store_true")
+    s.add_argument(
+        "--ships-from", default="any", choices=list(srv.SHIPS_FROM_CHOICES),
+        help="filter by despatch origin (default: any)",
+    )
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_search)
 
     d = sub.add_parser("details", help="fetch one product page")
     d.add_argument("url")
     d.set_defaults(func=cmd_details)
+
+    rv = sub.add_parser("reviews", help="buyer reviews and rating breakdown for a product")
+    rv.add_argument("url")
+    rv.add_argument("--limit", type=int, default=10)
+    rv.add_argument("--stars", type=int, choices=range(1, 6), default=None)
+    rv.add_argument("--sort", default="relevant", choices=list(srv.REVIEW_SORTS))
+    rv.add_argument("--json", action="store_true")
+    rv.set_defaults(func=cmd_reviews)
 
     c = sub.add_parser("categories", help="list category slugs")
     c.set_defaults(func=cmd_categories)

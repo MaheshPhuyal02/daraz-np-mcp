@@ -8,6 +8,7 @@ A Model Context Protocol server for searching products on Daraz Nepal
 Tools exposed:
     * search_daraz     - search / filter / sort the catalog
     * product_details  - full detail for a single product URL
+    * product_reviews  - star breakdown, buyer reviews and complaints
     * list_categories  - useful category slugs for focused searches
 
 No seller account or API key is required; only public endpoints are used.
@@ -36,6 +37,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from fastmcp import FastMCP
+
+import daraz_images as images
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -87,6 +90,38 @@ SORT_MAP = {
     "latest": "latest",
     "rating": "ratingscore",
 }
+
+# Daraz reports a seller's despatch location as a Nepali province (or city) for
+# domestic stock, and something else entirely for imports. We classify against
+# the domestic list rather than guessing at every possible foreign string.
+NEPAL_LOCATIONS = {
+    # Federal provinces, as Daraz spells them.
+    "koshi", "koshi province", "province 1", "province no. 1",
+    "madhesh", "madhesh province", "madhes", "province 2",
+    "bagmati", "bagmati province",
+    "gandaki", "gandaki province",
+    "lumbini", "lumbini province",
+    "karnali", "karnali province",
+    "sudurpashchim", "sudurpaschim", "sudurpashchim province", "far western",
+    # Cities Daraz sometimes shows instead of a province.
+    "kathmandu", "lalitpur", "bhaktapur", "pokhara", "biratnagar", "birgunj",
+    "butwal", "dharan", "hetauda", "janakpur", "nepalgunj", "itahari",
+    "chitwan", "bharatpur", "dhangadhi", "narayangarh",
+    "nepal",
+}
+
+# Substrings that mark an import wherever they appear (location or badge).
+OVERSEAS_MARKERS = (
+    "overseas", "abroad", "global", "international", "imported", "cross border",
+    "crossborder", "china", "shenzhen", "guangzhou", "hong kong", "singapore",
+    "india", "bangladesh", "pakistan", "thailand", "vietnam", "malaysia",
+)
+
+SHIPS_FROM_CHOICES = ("any", "nepal", "overseas")
+
+# Reviews live on the `my.` subdomain and need no login.
+REVIEW_URL = f"https://my.{DOMAIN.removeprefix('www.')}/pdp/review/getReviewList"
+REVIEW_SORTS = {"relevant": 0, "recent": 1}
 
 # A handful of frequently useful Daraz Nepal category slugs.
 CATEGORIES: Dict[str, str] = {
@@ -176,6 +211,8 @@ class Product:
     item_id: Optional[str] = None
     currency: str = "NPR"
     badges: List[str] = field(default_factory=list)
+    # "nepal", "overseas" or "unknown" - see classify_origin().
+    origin: str = "unknown"
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -240,6 +277,42 @@ class DarazNepal:
         if not url.startswith("http"):
             return f"{BASE_URL}/{url.lstrip('/')}"
         return url
+
+    @staticmethod
+    def classify_origin(
+        location: Optional[str],
+        badges: Optional[List[str]] = None,
+        seller: Optional[str] = None,
+    ) -> str:
+        """
+        Where a listing ships from: "nepal", "overseas" or "unknown".
+
+        Daraz has no explicit flag for this, so we read the despatch location:
+        a recognised Nepali province or city means domestic, an explicit import
+        marker anywhere means overseas, and any *other* non-empty location is
+        treated as overseas too — a location Daraz shows that isn't in Nepal is
+        exactly what an import looks like. An empty location stays "unknown"
+        and is never hidden by a filter, since we'd only be guessing.
+        """
+        haystacks = [str(location or "")]
+        haystacks.extend(str(b) for b in (badges or []))
+        haystacks.append(str(seller or ""))
+        blob = " ".join(haystacks).lower()
+
+        for marker in OVERSEAS_MARKERS:
+            if marker in blob:
+                return "overseas"
+
+        place = str(location or "").strip().lower()
+        if not place:
+            return "unknown"
+        if place in NEPAL_LOCATIONS:
+            return "nepal"
+        # Daraz sometimes appends a district: "Bagmati Province, Kathmandu".
+        for known in NEPAL_LOCATIONS:
+            if known in place:
+                return "nepal"
+        return "overseas"
 
     @staticmethod
     def _to_int(value: Any) -> Optional[int]:
@@ -311,6 +384,7 @@ class DarazNepal:
         if item.get("isSponsored"):
             badges.append("Sponsored")
 
+        location = item.get("location") or None
         return Product(
             name=name,
             url=url.split("?")[0],
@@ -321,13 +395,14 @@ class DarazNepal:
             reviews=self._to_int(item.get("review") or item.get("reviewCount")),
             sold=item.get("itemSoldCntShow") or None,
             seller=item.get("sellerName") or None,
-            location=item.get("location") or None,
+            location=location,
             brand=item.get("brandName") or None,
             image=self._abs_url(item.get("image") or ""),
             in_stock=in_stock,
             item_id=str(item.get("itemId") or item.get("nid") or "") or None,
             currency=item.get("currency") or "NPR",
             badges=badges,
+            origin=self.classify_origin(location, badges, item.get("sellerName")),
         )
 
     # -- catalog fetch ----------------------------------------------------- #
@@ -340,6 +415,7 @@ class DarazNepal:
         sort: Optional[str] = None,
         min_price: Optional[float] = None,
         max_price: Optional[float] = None,
+        ships_from: str = "any",
     ) -> List[Product]:
         """One page of catalog results. Returns [] on any failure."""
         self._warm_up()
@@ -359,6 +435,10 @@ class DarazNepal:
             lo = int(min_price) if min_price is not None else 0
             hi = int(max_price) if max_price is not None else 9999999
             params["price"] = f"{lo}-{hi}"
+        # No server-side location facet. Sending `location=` made Daraz return
+        # an empty payload, which silently fell through to the browser scraper
+        # and produced results with no prices at all. The client-side filter in
+        # search() is both correct and safe, so it does the whole job.
 
         try:
             response = self.session.get(
@@ -419,6 +499,7 @@ class DarazNepal:
         min_price: Optional[float] = None,
         max_price: Optional[float] = None,
         in_stock_only: bool = False,
+        ships_from: str = "any",
     ) -> List[Product]:
         collected: List[Product] = []
         seen: set[str] = set()
@@ -426,7 +507,7 @@ class DarazNepal:
         for page in range(1, max(1, pages) + 1):
             batch = self.fetch_page(
                 query, page, category=category, sort=sort,
-                min_price=min_price, max_price=max_price,
+                min_price=min_price, max_price=max_price, ships_from=ships_from,
             )
             if not batch:
                 break
@@ -436,6 +517,11 @@ class DarazNepal:
                 if key in seen:
                     continue
                 if in_stock_only and product.in_stock is False:
+                    continue
+                # "unknown" origin is never filtered out - we'd be guessing.
+                if ships_from == "nepal" and product.origin == "overseas":
+                    continue
+                if ships_from == "overseas" and product.origin != "overseas":
                     continue
                 # Server-side price filters are applied where supported; enforce
                 # them client-side too because category pages ignore `price`.
@@ -559,6 +645,77 @@ class DarazNepal:
         except json.JSONDecodeError:
             return None
 
+    # -- reviews ----------------------------------------------------------- #
+
+    @staticmethod
+    def item_id_from_url(url: str) -> Optional[str]:
+        """'.../some-product-i110309623-s1029898126.html' -> '110309623'"""
+        match = re.search(r"-i(\d+)(?:-s\d+)?\.html", url or "")
+        return match.group(1) if match else None
+
+    def reviews(
+        self,
+        item_id: str,
+        limit: int = 10,
+        stars: Optional[int] = None,
+        sort: str = "relevant",
+        max_pages: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Written reviews for one item, plus the rating summary.
+
+        Rating-only entries (no text) are skipped, so this pages forward until
+        it has `limit` reviews worth reading or runs out of pages.
+        """
+        self._warm_up()
+        found: List[Dict[str, Any]] = []
+        summary: Dict[str, Any] = {}
+        item: Dict[str, Any] = {}
+
+        for page in range(1, max_pages + 1):
+            response = self.session.get(
+                REVIEW_URL,
+                params={
+                    "itemId": item_id,
+                    "pageSize": 20,
+                    # Daraz's `filter` is the star level; 0 means all.
+                    "filter": stars or 0,
+                    "sort": REVIEW_SORTS.get(sort, 0),
+                    "pageNo": page,
+                },
+                headers=_headers(),
+                timeout=TIMEOUT,
+            )
+            response.raise_for_status()
+            model = (response.json() or {}).get("model") or {}
+            summary = summary or model.get("ratings") or {}
+            item = item or model.get("item") or {}
+
+            batch = model.get("items") or []
+            for entry in batch:
+                text = (entry.get("reviewContent") or "").strip()
+                if not text or (stars and entry.get("rating") != stars):
+                    continue
+                replies = entry.get("replies") or []
+                found.append({
+                    "rating": entry.get("rating"),
+                    "date": entry.get("reviewTime"),
+                    "buyer": entry.get("buyerName"),
+                    "verified": bool(entry.get("isPurchased")),
+                    "variant": entry.get("skuInfo"),
+                    "text": text,
+                    "likes": entry.get("likeCount") or 0,
+                    "images": [i["url"] for i in entry.get("images") or [] if i.get("url")],
+                    "seller_reply": (replies[0].get("reviewContent") or "").strip() if replies else "",
+                })
+
+            total_pages = (model.get("paging") or {}).get("totalPages") or 0
+            if len(found) >= limit or not batch or page >= total_pages:
+                break
+            time.sleep(random.uniform(0.6, 1.4))
+
+        return {"item": item, "ratings": summary, "reviews": found[:limit]}
+
     # -- Playwright fallback ---------------------------------------------- #
 
     def browser_search(self, query: str, page: int = 1) -> List[Product]:
@@ -627,44 +784,81 @@ def _money(value: Optional[float]) -> str:
     return f"{CURRENCY} {value:,.0f}" if value is not None else "price unavailable"
 
 
+def _product_lines(index: int, p: Product) -> List[str]:
+    """The text block for a single product. One place, so every caller agrees."""
+    lines = [f"**{index}. {p.name}**"]
+
+    if p.original_price and p.price:
+        saving = p.original_price - p.price
+        lines.append(
+            f"   Price: **{_money(p.price)}**  ~~{_money(p.original_price)}~~"
+            f"  ({p.discount or ''} off, saves {_money(saving)})".replace("( off", "(")
+        )
+    else:
+        lines.append(f"   Price: **{_money(p.price)}**")
+
+    meta = []
+    if p.rating:
+        meta.append(f"{p.rating}/5" + (f" ({p.reviews} reviews)" if p.reviews else ""))
+    if p.sold:
+        meta.append(str(p.sold))
+    if p.brand:
+        meta.append(f"Brand: {p.brand}")
+    if p.location:
+        meta.append(p.location)
+    # Don't say "Overseas · Overseas" when the location already says it.
+    if p.origin == "overseas" and "overseas" not in (p.location or "").lower():
+        meta.append("**Overseas**")
+    if p.in_stock is False:
+        meta.append("Out of stock")
+    if p.badges:
+        meta.append(", ".join(p.badges[:3]))
+    if meta:
+        lines.append("   " + " · ".join(meta))
+
+    if p.seller:
+        lines.append(f"   Seller: {p.seller}")
+    lines.append(f"   {p.url}")
+    return lines
+
+
 def _format_products(products: List[Product], header: str, note: str = "") -> str:
     lines = [f"**{header}**", ""]
     for index, p in enumerate(products, 1):
-        lines.append(f"**{index}. {p.name}**")
-
-        if p.original_price and p.price:
-            saving = p.original_price - p.price
-            lines.append(
-                f"   Price: **{_money(p.price)}**  ~~{_money(p.original_price)}~~"
-                f"  ({p.discount or ''} off, saves {_money(saving)})".replace("( off", "(")
-            )
-        else:
-            lines.append(f"   Price: **{_money(p.price)}**")
-
-        meta = []
-        if p.rating:
-            meta.append(f"{p.rating}/5" + (f" ({p.reviews} reviews)" if p.reviews else ""))
-        if p.sold:
-            meta.append(str(p.sold))
-        if p.brand:
-            meta.append(f"Brand: {p.brand}")
-        if p.location:
-            meta.append(p.location)
-        if p.in_stock is False:
-            meta.append("Out of stock")
-        if p.badges:
-            meta.append(", ".join(p.badges[:3]))
-        if meta:
-            lines.append("   " + " · ".join(meta))
-
-        if p.seller:
-            lines.append(f"   Seller: {p.seller}")
-        lines.append(f"   {p.url}")
+        lines.extend(_product_lines(index, p))
         lines.append("")
-
     if note:
         lines.append(note)
     return "\n".join(lines)
+
+
+def _format_with_images(
+    products: List[Product], header: str, note: str, limit: int
+) -> List[Any]:
+    """
+    Text and pictures interleaved, as a list of MCP content blocks.
+
+    Each product's description comes first, then its thumbnail, so the model and
+    the reader can tell which picture belongs to which item. Products whose
+    image fails to load still get their text — a broken thumbnail is never
+    allowed to cost you a search result.
+    """
+    wanted = [p.image for p in products[:limit] if p.image]
+    fetched = images.fetch_thumbnails(daraz.session, wanted, limit=limit)
+
+    blocks: List[Any] = [f"**{header}**"]
+    for index, product in enumerate(products, 1):
+        blocks.append("\n".join(_product_lines(index, product)))
+        shot = fetched.get(product.image or "")
+        if shot:
+            blocks.append(images.to_image_block(*shot))
+
+    missing = len([p for p in products[:limit] if p.image]) - len(fetched)
+    if missing > 0:
+        blocks.append(f"({missing} image(s) could not be loaded.)")
+    if note:
+        blocks.append(note)
+    return blocks
 
 
 # --------------------------------------------------------------------------- #
@@ -680,9 +874,11 @@ def _search_daraz(
     max_price: Optional[float] = None,
     category: Optional[str] = None,
     in_stock_only: bool = False,
+    ships_from: str = "any",
+    include_images: bool = False,
     pages: int = 3,
     as_json: bool = False,
-) -> str:
+) -> Any:
     """
     Search Daraz Nepal (daraz.com.np) for products. Prices are in NPR.
 
@@ -696,12 +892,22 @@ def _search_daraz(
         category: Optional category slug to search within, e.g. "mobile-phones".
                   Call list_categories() to see common slugs.
         in_stock_only: Drop items Daraz reports as out of stock.
+        ships_from: Where the item ships from — "any" (default), "nepal" for
+                    local stock only, or "overseas" for imports only. Items
+                    shipped from abroad are cheap but slow (often 2-4 weeks),
+                    so use "nepal" when the user needs something quickly.
+        include_images: Attach a photo of each product. Turn this ON whenever
+                    the user wants to *see* things — "show me", "what does it
+                    look like", clothes, furniture, decor, gifts — and leave it
+                    off for price or spec questions, where pictures only add
+                    latency. Applies to the first few results only.
         pages: How many result pages to pull (1-10). More pages = slower.
         as_json: Return structured JSON instead of formatted text.
 
     Returns:
         Formatted product list (name, price, discount, rating, seller, link),
-        or a JSON array when as_json=True.
+        with product photos when include_images=True, or a JSON array when
+        as_json=True.
     """
     query = (query or "").strip()
     if not query and not category:
@@ -709,6 +915,11 @@ def _search_daraz(
 
     limit = max(1, min(int(limit), 50))
     pages = max(1, min(int(pages), 10))
+
+    ships_from = (ships_from or "any").strip().lower()
+    if ships_from not in SHIPS_FROM_CHOICES:
+        logger.info("Unknown ships_from '%s' - showing everything", ships_from)
+        ships_from = "any"
 
     # Natural-language shortcuts the model may not translate into params.
     lowered = query.lower()
@@ -730,6 +941,7 @@ def _search_daraz(
         min_price=min_price,
         max_price=max_price,
         in_stock_only=in_stock_only,
+        ships_from=ships_from,
     )
 
     if not products:
@@ -742,10 +954,18 @@ def _search_daraz(
         bounds = ""
         if min_price is not None or max_price is not None:
             bounds = f" between {_money(min_price or 0)} and {_money(max_price)}"
-        return (
-            f"No products found on Daraz Nepal for '{query}'{bounds}.\n"
-            "Try a shorter or more common search term, or widen the price range."
-        )
+        origin_note = ""
+        if ships_from == "nepal":
+            origin_note = " shipping from within Nepal"
+        elif ships_from == "overseas":
+            origin_note = " shipping from overseas"
+        hint = "Try a shorter or more common search term, or widen the price range."
+        if ships_from != "any":
+            hint = (
+                "Try a shorter search term, widen the price range, or drop the "
+                'ships_from filter (ships_from="any") to include the rest.'
+            )
+        return f"No products found on Daraz Nepal for '{query}'{bounds}{origin_note}.\n{hint}"
 
     # Client-side sort guarantees the requested order even if Daraz ignores it.
     if sort_key == "priceasc":
@@ -767,20 +987,28 @@ def _search_daraz(
         header = f"{len(products)} results for '{label}' on Daraz Nepal"
     if category:
         header += f" · category: {category}"
+    if ships_from == "nepal":
+        header += " · ships from Nepal"
+    elif ships_from == "overseas":
+        header += " · ships from overseas"
 
     note = (
         "Prices are live from daraz.com.np and can change; check the product page "
         "for final price, delivery cost and seller rating."
     )
+    if include_images:
+        return _format_with_images(products, header, note, limit=images.MAX_IMAGES)
     return _format_products(products, header, note)
 
 
-def _product_details(url: str) -> str:
+def _product_details(url: str, include_image: bool = False) -> Any:
     """
     Fetch full details for one Daraz Nepal product page.
 
     Args:
         url: A daraz.com.np product URL (as returned by search_daraz).
+        include_image: Attach the product photo. Turn this on when the user
+                    wants to see the item, not just read its specs.
 
     Returns:
         Name, price, discount, rating, review count, seller, availability and
@@ -819,7 +1047,130 @@ def _product_details(url: str) -> str:
         lines.append(data["highlights"])
     lines.append("")
     lines.append(data["url"])
-    return "\n".join(lines)
+    text = "\n".join(lines)
+
+    if include_image and data.get("image"):
+        shot = images.fetch_thumbnail(daraz.session, str(data["image"]))
+        if shot:
+            return [text, images.to_image_block(*shot)]
+    return text
+
+
+def _review_lines(review: Dict[str, Any]) -> List[str]:
+    meta = [f"{review['rating']}/5"]
+    if review.get("date"):
+        meta.append(review["date"])
+    if review.get("verified"):
+        meta.append("verified purchase")
+    if review.get("variant"):
+        meta.append(review["variant"])
+    if review.get("images"):
+        meta.append(f"{len(review['images'])} photo(s)")
+    if review.get("likes"):
+        meta.append(f"{review['likes']} found helpful")
+
+    text = review["text"]
+    lines = [f"- {' · '.join(meta)}", f"  \"{text[:600]}{'...' if len(text) > 600 else ''}\""]
+    if review.get("seller_reply"):
+        lines.append(f"  Seller replied: \"{review['seller_reply'][:200]}\"")
+    return lines
+
+
+def _product_reviews(
+    url: str,
+    limit: int = 10,
+    stars: Optional[int] = None,
+    sort: str = "relevant",
+    include_images: bool = False,
+    as_json: bool = False,
+) -> Any:
+    """
+    Read buyer reviews for one Daraz product: the star breakdown, what buyers
+    actually wrote, and a separate look at the 1-2 star complaints.
+
+    Use this to answer "is it any good?", "what do people complain about?" or
+    "does it match the photos?" - things the listing itself won't tell you.
+    Summarise recurring praise and complaints for the user rather than
+    repeating every review.
+
+    Args:
+        url: A Daraz product URL (as returned by search_daraz).
+        limit: How many written reviews to return (default 10, max 50).
+        stars: Only reviews with this star rating (1-5). Leave empty for all.
+        sort: "relevant" (Daraz's default ordering) or "recent".
+        include_images: Attach the photos buyers uploaded - the most honest
+                    picture of what arrives. Turn on for "what does it really
+                    look like" questions.
+        as_json: Return structured JSON instead of formatted text.
+    """
+    item_id = daraz.item_id_from_url(url)
+    if not item_id:
+        return "Please pass a full Daraz product URL, e.g. https://www.daraz.com.np/products/...-i123456.html"
+
+    limit = max(1, min(int(limit), 50))
+    if stars is not None and stars not in range(1, 6):
+        return "stars must be between 1 and 5, or left empty for all reviews."
+    sort = sort if sort in REVIEW_SORTS else "relevant"
+
+    try:
+        data = daraz.reviews(item_id, limit=limit, stars=stars, sort=sort)
+        # The complaints are what people most need and the default ordering
+        # buries them, so fetch them separately unless a filter is already set.
+        critical: List[Dict[str, Any]] = []
+        low_count = (data["ratings"].get("scores") or [0] * 5)[3:]
+        if stars is None and sum(low_count):
+            seen = {r["text"] for r in data["reviews"]}
+            critical = [
+                r for r in daraz.reviews(item_id, limit=5, stars=1)["reviews"]
+                + daraz.reviews(item_id, limit=5, stars=2)["reviews"]
+                if r["text"] not in seen
+            ][:5]
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not load reviews: {exc}"
+
+    if as_json:
+        return json.dumps({**data, "critical": critical}, indent=2, ensure_ascii=False)
+
+    ratings = data["ratings"]
+    title = data["item"].get("itemTitle") or "this product"
+    if not ratings.get("rateCount"):
+        return f"**{title}** has no ratings on Daraz yet."
+
+    total = ratings["rateCount"]
+    lines = [
+        f"**Reviews: {title}**",
+        "",
+        f"Rating: **{ratings.get('average')}/5** from {total:,} ratings"
+        + (f" · {ratings['withImageCount']} with buyer photos" if ratings.get("withImageCount") else ""),
+    ]
+    for star, count in zip(range(5, 0, -1), ratings.get("scores") or []):
+        lines.append(f"- {star} stars: {count:,} ({count / total:.0%})")
+
+    heading = f"{stars}-star reviews" if stars else f"{'Most recent' if sort == 'recent' else 'Top'} reviews"
+    lines += ["", f"**{heading}**"]
+    if data["reviews"]:
+        for review in data["reviews"]:
+            lines += _review_lines(review)
+    else:
+        lines.append("No written reviews - buyers left ratings only.")
+
+    if critical:
+        lines += ["", "**Critical reviews (1-2 stars)**"]
+        for review in critical:
+            lines += _review_lines(review)
+
+    lines += ["", url.split("?")[0]]
+    text = "\n".join(lines)
+
+    if not include_images:
+        return text
+    photos = list(dict.fromkeys(u for r in data["reviews"] + critical for u in r["images"]))
+    fetched = images.fetch_thumbnails(daraz.session, photos, limit=images.MAX_IMAGES)
+    blocks: List[Any] = [text, "**Buyer photos**"]
+    blocks += [images.to_image_block(*fetched[u]) for u in photos if u in fetched]
+    if len(blocks) == 2:
+        blocks[1] = "(No buyer photos could be loaded.)"
+    return blocks
 
 
 def _list_categories() -> str:
@@ -842,6 +1193,7 @@ def _list_categories() -> str:
 # CLI harness and tests can use them without an MCP client.
 search_daraz = mcp.tool(name="search_daraz")(_search_daraz)
 product_details = mcp.tool(name="product_details")(_product_details)
+product_reviews = mcp.tool(name="product_reviews")(_product_reviews)
 list_categories = mcp.tool(name="list_categories")(_list_categories)
 
 

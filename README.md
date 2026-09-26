@@ -72,8 +72,10 @@ More CLI examples:
 ```bash
 python daraz_cli.py search "wireless mouse" --limit 5
 python daraz_cli.py search "gas stove" --sort price_low --max-price 8000
+python daraz_cli.py search "headphones" --ships-from nepal
 python daraz_cli.py search "tv" --category televisions --json
 python daraz_cli.py details "https://www.daraz.com.np/products/....html"
+python daraz_cli.py reviews "https://www.daraz.com.np/products/....html"
 python daraz_cli.py categories
 ```
 
@@ -159,20 +161,92 @@ shape as the Claude Desktop block above, in that client's MCP config
 | `min_price` / `max_price` | float | — | NPR, pushed to Daraz's own filter |
 | `category` | str | — | slug, e.g. `mobile-phones` (see `list_categories`) |
 | `in_stock_only` | bool | false | drop out-of-stock items |
+| `ships_from` | str | `any` | `nepal` for local stock only, `overseas` for imports only |
+| `include_images` | bool | false | attach product photos (see [Product images](#product-images)) |
 | `pages` | int | 3 | result pages to pull, 1–10 |
 | `as_json` | bool | false | structured output instead of markdown |
 
 Queries containing "cheapest"/"cheap" auto-switch to `price_low`; "most
 expensive"/"premium" to `price_high`.
 
-### `product_details(url)`
+### `product_details(url, include_image=False)`
 
 Name, price, original price, brand, rating, review count, seller (+ positive
-rating), stock and a trimmed description for a single product page.
+rating), stock and a trimmed description for a single product page. Pass
+`include_image=True` to get the photo alongside the text.
+
+### `product_reviews(url, ...)`
+
+What buyers actually say about a product: the star breakdown, their written reviews, and a separate section of 1-2 star complaints.
+The complaints are fetched on their own because Daraz's default ordering buries them.
+
+| Arg | Type | Default | Notes |
+|---|---|---|---|
+| `url` | str | — | product URL from `search_daraz` |
+| `limit` | int | 10 | written reviews to return, 1–50 |
+| `stars` | int | — | only reviews with this rating, 1–5 |
+| `sort` | str | `relevant` | or `recent` |
+| `include_images` | bool | false | attach the photos buyers uploaded |
+| `as_json` | bool | false | structured output instead of markdown |
+
+Rating-only entries with no text are skipped, and each review shows its date, variant, whether it was a verified purchase and the seller's reply.
+Reviews come from Daraz's public review endpoint, so no login is needed.
+
+```bash
+python daraz_cli.py reviews "https://www.daraz.com.np/products/....html"
+python daraz_cli.py reviews "https://www.daraz.com.np/products/....html" --stars 1 --sort recent
+```
 
 ### `list_categories()`
 
 Common Daraz Nepal category slugs for focused searches.
+
+### Where things ship from
+
+Daraz Nepal lists imports next to local stock. They are usually cheaper and
+usually much slower — two to four weeks is normal — so it matters which you're
+looking at.
+
+Every result is tagged. Anything shipping from abroad is marked **Overseas** in
+the output, and `ships_from` narrows the search:
+
+```bash
+python daraz_cli.py search "mechanical keyboard" --ships-from nepal
+```
+
+The classification reads the seller's despatch location: a recognised Nepali
+province or city is domestic, an explicit import marker (`Overseas`, `China`,
+`Global`, …) anywhere in the location, badges or seller name is overseas, and
+any *other* non-empty location is treated as overseas too. When Daraz gives no
+location at all the item is `unknown` — and a `ships_from` filter never hides
+those, because hiding a result on a guess is worse than showing one extra.
+
+`ships_from` is also passed to Daraz's own location facet, so most of the work
+happens server-side; the client-side filter is the guarantee for the regions
+that ignore it.
+
+### Product images
+
+Text-only search tells you a mouse costs Rs. 1,299. It doesn't tell you it's
+lime green. Pass `include_images=True` and each result comes back with its
+photo attached, interleaved so every picture follows its own product:
+
+```
+search_daraz("office chair", include_images=True)
+```
+
+Images are **off by default**, because they cost context and add a round-trip
+per picture — the tool description tells the assistant to switch them on for
+"show me" questions and leave them off for price checks.
+
+Costs are capped, in this order: Daraz's CDN resizes to a ~300px thumbnail
+before anything is downloaded, at most `DARAZ_MAX_IMAGES` are fetched, and any
+single image over `DARAZ_MAX_IMAGE_BYTES` is dropped mid-download rather than
+sent. A picture that fails to load never costs you the result — the text entry
+is always there, and the reply says how many images were missing.
+
+The CLI is text-only, so `--json` and plain search print a note where images
+would be. They render in an MCP client.
 
 ## Configuration
 
@@ -185,6 +259,11 @@ All optional — set them in the `env` block of your MCP client config.
 | `DARAZ_TIMEOUT` | `20` | seconds per HTTP request |
 | `DARAZ_LOG_FILE` | unset | write a debug log to this path |
 | `DARAZ_LOG_LEVEL` | `INFO` | `DEBUG` for verbose tracing |
+| `DARAZ_MAX_IMAGES` | `8` | most product photos attached to one reply |
+| `DARAZ_MAX_IMAGE_BYTES` | `409600` | drop any single image larger than this |
+| `DARAZ_THUMB_SIZE` | `300` | thumbnail edge in px requested from Daraz's CDN |
+| `DARAZ_THUMB_QUALITY` | `80` | thumbnail JPEG quality requested from the CDN |
+| `DARAZ_IMAGE_TIMEOUT` | `10` | seconds per image fetch |
 
 ## How it works
 
@@ -198,8 +277,13 @@ GET https://www.daraz.com.np/{category}/?ajax=true&page=1
 
 Products live at `mods.listItems` (the client also probes `data.mods.listItems`,
 `listItems`, `results` and `data.products` since Daraz A/B-tests its response
-shape). Sorting and price bounds are passed as `sort=` and `price=min-max` so
-Daraz does the work server-side; the result is re-sorted locally as a guard.
+shape). Sorting, price bounds and despatch location are passed as `sort=`,
+`price=min-max` and `location=` so Daraz does the work server-side; the result
+is re-sorted and re-filtered locally as a guard.
+
+Product photos come from the same CDN the storefront uses. Appending
+`_300x300q80.jpg_.webp` to an image path makes Daraz return a thumbnail, so the
+server never downloads a full-size original just to shrink it.
 
 If the JSON endpoint returns HTML (anti-bot page), the server falls back to
 rendering the search page with Playwright — install it or that step is skipped
@@ -223,9 +307,20 @@ the same command by hand in a terminal should hang silently rather than error.
 **`ModuleNotFoundError: fastmcp`**
 The client is using a Python without the dependencies installed — see above.
 
+**`ships_from="nepal"` still shows an overseas item**
+Its despatch location was blank, so the item is classified `unknown` and the
+filter deliberately leaves it in rather than hiding a result on a guess. If
+Daraz is showing a location the classifier does not recognise, add it to
+`NEPAL_LOCATIONS` or `OVERSEAS_MARKERS` in `daraz_np_server.py`.
+
+**`include_images=True` returns text but no pictures**
+The reply says how many images failed. Most often Daraz's CDN refused the
+resized URL and the original was over `DARAZ_MAX_IMAGE_BYTES` — raise that, or
+lower `DARAZ_THUMB_SIZE`. Run with `DARAZ_LOG_LEVEL=DEBUG` to see each fetch.
+
 ## Notes and limits
 
-- Public endpoints only; no login, no seller API. Daraz can change or throttle
+- Search uses public endpoints only; no seller API. Daraz can change or throttle
   them at any time — `python daraz_cli.py doctor` tells you which.
 - Requests are paced 0.6–1.4 s apart with a rotating User-Agent. Don't raise
   `pages` far beyond the default if you're running many searches.
